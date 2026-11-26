@@ -1,6 +1,7 @@
 #pragma once
 #include "world/map.hpp"
 #include <memory>
+#include "settings.hpp"
 #include <string>
 #include <windows.h>
 class Renderer
@@ -9,9 +10,10 @@ class Renderer
     explicit Renderer(HWND);
     ~Renderer();
     void upload(Map &);
-    void draw(Camera const &, bool measure);
+    TraceSettings settings;
+    bool draw(Camera const &, bool measure);
     void setFullScreen(bool fullscreen, bool acquire);
-    bool isFullScreenExclusive() const;
+    double cpuMilliseconds() const;
     double gpuMilliseconds() const;
     const std::string &adapterName() const;
 

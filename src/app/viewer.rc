@@ -1,4 +1,5 @@
 #include <windows.h>
+1 ICON "assets/icon.ico"
 101 RCDATA "assets/atlas.rgba"
 102 RCDATA "assets/maps/TestMap.txt"
 200 DIALOGEX 0,0,385,240
@@ -9,6 +10,7 @@ BEGIN
  LTEXT "Map code", -1,12,12,355,12
  EDITTEXT 201,12,28,361,150,ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
  LTEXT "Paste a map export, then choose Load map.",202,12,185,361,22
+ PUSHBUTTON "Rendering settings (F2)",204,12,214,110,16
  PUSHBUTTON "Back to map",IDCANCEL,170,214,58,16
  PUSHBUTTON "Quit",203,233,214,58,16
  DEFPUSHBUTTON "Load map",IDOK,296,214,77,16

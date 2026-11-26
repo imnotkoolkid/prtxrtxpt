@@ -1,0 +1,109 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "frame.glsl"
+#include "guide.glsl"
+#include "traversal.glsl"
+#include "transport.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 5) uniform sampler2D oldColor;
+layout(binding = 6) uniform sampler2D oldGeometry;
+layout(binding = 7) uniform sampler2D oldGuide;
+layout(rgba32f, binding = 8) uniform writeonly image2D color;
+layout(rgba32f, binding = 9) uniform writeonly image2D geometry;
+layout(rgba16f, binding = 10) uniform writeonly image2D guide;
+layout(binding = 11) uniform sampler2D oldSpecular;
+layout(rgba32f, binding = 12) uniform writeonly image2D specular;
+
+float geometryKey(Hit h) {
+    vec3 n = h.n;
+    uint face = abs(n.y) > .9   ? (n.y > 0. ? 0u : 1u)
+                : abs(n.x) > .9 ? (n.x > 0. ? 2u : 3u)
+                : abs(n.z) > .9 ? (n.z > 0. ? 4u : 5u)
+                                : (n.z > 0. ? 6u : 7u);
+    return float(h.id * 128u + uint(round(palette[h.id].optics.x * 15.)) * 8u + face);
+}
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), size = imageSize(color);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    seed = uint(p.x) * 1973u + uint(p.y) * 9277u + f.sequence.x * 26699u + 911u;
+    random();
+    bool valid = f.sampling.w != 0, still = f.sequence.y != 0u;
+    vec4 g = vec4(0), aux = vec4(0);
+    if (valid && still && enabled(ADAPT)) {
+        vec4 old = texelFetch(oldColor, p, 0), spec = texelFetch(oldSpecular, p, 0);
+        aux = texelFetch(oldGuide, p, 0);
+        vec2 y = vec2(luminance(old.rgb), luminance(spec.rgb));
+        vec2 variance = max(vec2(0), exp2(vec2(aux.a, spec.a)) - 1. - y * y);
+        float error = dot(sqrt(variance), vec2(1.)) / sqrt(max(1., old.a));
+        if (old.a >= 24. && error < .018 * (.1 + y.x + y.y) && random() < .875) {
+            imageStore(color, p, old);
+            imageStore(guide, p, aux);
+            imageStore(specular, p, spec);
+            imageStore(geometry, p, texelFetch(oldGeometry, p, 0));
+            return;
+        }
+    }
+    mat3 cam = basis(f.camera.w, f.lens.x);
+    // Keep the reconstruction guide at the pixel center. Jitter belongs to the
+    // radiance estimator and should never invalidate a stationary pixel's samples.
+    if (valid && still) {
+        g = texelFetch(oldGeometry, p, 0);
+        aux.rgb = texelFetch(oldGuide, p, 0).rgb;
+    } else {
+        vec2 uv = 2. * (vec2(p) + .5) / vec2(size) - 1.;
+        vec3 d = normalize(cam * vec3(uv.x * f.lens.z, -uv.y, 1));
+        Hit hit = trace(f.camera.xyz, d, false);
+        g = hit.id != 0u ? vec4(f.camera.xyz + hit.t * d, geometryKey(hit)) : vec4(d, hit.t > 0. ? 0. : -1.);
+        aux.rgb = hit.albedo;
+    }
+    vec3 diffuse = vec3(0), gloss = vec3(0);
+    vec2 moments = vec2(0);
+    for (int i = 0; i < f.limits.x; ++i) {
+        vec2 jitter = vec2(random(), random());
+        vec2 uv = 2. * (vec2(p) + jitter) / vec2(size) - 1.;
+        vec3 d = normalize(cam * vec3(uv.x * f.lens.z, -uv.y, 1));
+        vec3 spec;
+        vec3 radiance = transport(f.camera.xyz, d, spec);
+        if (any(isnan(radiance)) || any(isinf(radiance))) {
+            radiance = vec3(0);
+            spec = vec3(0);
+        }
+        diffuse += radiance - spec;
+        gloss += spec;
+        vec2 y = vec2(luminance(radiance - spec), luminance(spec));
+        moments += y * y;
+    }
+    float samples = float(f.limits.x);
+    diffuse /= samples;
+    gloss /= samples;
+    moments /= samples;
+    if (valid) {
+        vec3 delta = g.w > 0. ? g.xyz - f.previous.xyz : g.xyz;
+        vec3 view = transpose(basis(f.previous.w, f.lens.y)) * delta;
+        vec2 uv = .5 + .5 * vec2(view.x / f.lens.z, -view.y) / max(view.z, .000001);
+        ivec2 q = still ? p : ivec2(floor(uv * size));
+        if ((still || view.z > 0.) && all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size))) {
+            vec4 prev = texelFetch(oldGeometry, q, 0), a = texelFetch(oldGuide, q, 0);
+            float footprint = max(.008, 2.5 * max(view.z, 1.) / size.y);
+            vec3 n = guideNormal(g.w), separation = g.xyz - prev.xyz;
+            bool same =
+                g.w == prev.w && (g.w <= 0. || (abs(dot(n, separation)) < .005 &&
+                                                length(separation) < surfaceFootprint(footprint, delta, n)));
+            if (still || (same && distance(a.rgb, aux.rgb) < .18)) {
+                vec4 old = texelFetch(oldColor, q, 0), spec = texelFetch(oldSpecular, q, 0);
+                float rough = float((uint(max(0., g.w)) >> 3u) & 15u) / 15.;
+                vec2 count = min(vec2(old.a), still ? vec2(65536.) : vec2(12., 1. + 8. * rough * rough));
+                vec2 alpha = samples / (samples + count);
+                diffuse = mix(old.rgb, diffuse, alpha.x);
+                gloss = mix(spec.rgb, gloss, alpha.y);
+                moments = mix(exp2(vec2(a.a, spec.a)) - 1., moments, alpha);
+                samples += count.x;
+            }
+        }
+    }
+    imageStore(color, p, vec4(diffuse, samples));
+    imageStore(geometry, p, g);
+    imageStore(guide, p, vec4(aux.rgb, log2(1. + moments.x)));
+    imageStore(specular, p, vec4(gloss, log2(1. + moments.y)));
+}

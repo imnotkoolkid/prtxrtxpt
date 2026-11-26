@@ -1,6 +1,6 @@
 /build*/
 /out/
 /.vs/
-/tests/
-/assets/maps/
+/assets/maps/*
+!/assets/maps/TestMap.txt
 /scripts/

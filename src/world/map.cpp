@@ -46,7 +46,6 @@ Block resolve(int id, bool legacy)
     return blocks[0];
 }
 
-// Base-62 string → uint64. Throws on invalid input or overflow.
 uint64_t decode(winrt::hstring const &code)
 {
     if (code.empty()) throw std::runtime_error("Empty block ID.");
@@ -63,7 +62,6 @@ uint64_t decode(winrt::hstring const &code)
     return n;
 }
 
-// Validates that n is a non-negative integer <= max; throws otherwise.
 int integer(double n, int max)
 {
     if (!(n >= 0 && n <= max && n == std::floor(n)))
@@ -81,9 +79,9 @@ bool position(IJsonValue value, Vec &pos)
     pos = {float(a.GetNumberAt(0)), float(a.GetNumberAt(1)), float(a.GetNumberAt(2))};
     return std::isfinite(pos.x) && std::isfinite(pos.y) && std::isfinite(pos.z);
 }
-} // namespace
+} 
 
-Map loadMap(std::wstring_view json)
+Map loadMap(std::wstring_view json, bool buildMesh)
 {
     try
     {
@@ -97,9 +95,12 @@ Map loadMap(std::wstring_view json)
         if (version < 1 || version > 3 || optInt(L"chnkSize", 16) != 16)
             throw std::runtime_error("Expected a v1-v3 map with 16-voxel chunks.");
 
-        World world;
-        world.palette.reserve(64);
         Map out;
+        if (root.HasKey(L"n") && root.Lookup(L"n").ValueType() == JsonValueType::String)
+            out.name = winrt::to_string(root.GetNamedString(L"n"));
+        out.world = std::make_shared<World>();
+        World &world = *out.world;
+        world.palette.reserve(64);
         int first = -1;
         std::unordered_map<int, uint16_t> ids;
         ids.reserve(64);
@@ -118,7 +119,10 @@ Map loadMap(std::wstring_view json)
                 if (first < 0) first = key;
                 auto block = resolve(id > 1199999 ? 1 : int(id), version == 1);
                 auto [it, inserted] = ids.try_emplace(block.id, uint16_t(world.palette.size()));
-                if (inserted) world.palette.push_back(block);
+                if (inserted) {
+                    if (world.palette.size() >= 65536) throw std::runtime_error("Map palette is full.");
+                    world.palette.push_back(block);
+                }
                 auto &chunk = world.chunks[key];
                 if (!chunk) chunk = std::make_unique<Chunk>();
                 std::fill_n(chunk->begin() + start, len, it->second);
@@ -126,9 +130,9 @@ Map loadMap(std::wstring_view json)
         }
 
         for (int key = 0; key < 4096; ++key)
-            if (world.chunks[key]) mesh(world, key, out);
+            if (buildMesh && world.chunks[key]) mesh(world, key, out);
 
-        // Camera: use first spawn if present, otherwise derive from map bounds.
+  
         bool spawned = false;
         if (root.HasKey(L"spwns") && root.Lookup(L"spwns").ValueType() == JsonValueType::Array)
             for (auto spawn : root.GetNamedArray(L"spwns"))
@@ -150,7 +154,6 @@ Map loadMap(std::wstring_view json)
                              lo.x <= hi.x && lo.y <= hi.y && lo.z <= hi.z;
             if (!hasBounds)
             {
-                // Fallback: frame the first occupied chunk.
                 lo = first < 0 ? Vec{120, 64, 120}
                                : Vec{float(first >> 8 << 4), float((first >> 4 & 15) << 4),
                                      float((first & 15) << 4)};
@@ -160,7 +163,7 @@ Map loadMap(std::wstring_view json)
             out.camera.pos   = {(lo.x + hi.x) / 2, (lo.y + hi.y) / 2 + .6f * d, hi.z + d};
             out.camera.pitch = -std::atan2(.6f * d, d + (hi.z - lo.z) / 2);
         }
-        out.camera.pos.y += .775f; // Eye height offset.
+        out.camera.pos.y += .775f; 
         return out;
     }
     catch (winrt::hresult_error const &)

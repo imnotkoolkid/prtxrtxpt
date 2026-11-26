@@ -1,8 +1,10 @@
 #include "renderer.hpp"
+#include "trace.hpp"
 #include <DirectXMath.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <vulkan/vulkan.hpp>
@@ -17,9 +19,7 @@ constexpr uint32_t fragmentCode[] =
 #include "map.frag.inc"
     ;
 
-struct Buffer  { vk::UniqueDeviceMemory memory; vk::UniqueBuffer handle; };
-struct Texture { vk::UniqueDeviceMemory memory; vk::UniqueImage image; vk::UniqueImageView view; };
-struct Frame   { vk::UniqueFence fence, acquired; vk::UniqueCommandBuffer cmd; bool timed = false; };
+struct Frame   { vk::UniqueFence fence; vk::UniqueSemaphore acquired; vk::UniqueCommandBuffer cmd; bool timed = false; };
 struct Target  { Texture depth; vk::UniqueImageView color; vk::UniqueFramebuffer framebuffer;
                  vk::UniqueSemaphore presented; };
 struct Swap    { vk::Extent2D extent; vk::UniqueSwapchainKHR chain; std::vector<Target> targets;
@@ -41,18 +41,19 @@ Frustum chunkFrustum(XMFLOAT4X4 const &m)
     }
     return f;
 }
-} // namespace
+} 
 
-struct Renderer::State
+struct Renderer::State : Resources
 {
     HWND hwnd;
     vk::UniqueInstance instance;
     vk::UniqueSurfaceKHR surface;
-    vk::PhysicalDevice physical;
     uint32_t family{};
     vk::UniqueDevice device;
     vk::Queue queue;
     vk::UniqueCommandPool pool;
+    vk::UniqueCommandBuffer transferCommand;
+    vk::UniqueFence transferFence;
     vk::UniqueDescriptorSetLayout descriptors;
     vk::UniquePipelineLayout layout;
     vk::Format colorFormat{}, depthFormat{};
@@ -62,6 +63,9 @@ struct Renderer::State
     vk::UniqueSampler sampler;
     vk::UniqueDescriptorPool descriptorPool;
     vk::DescriptorSet set;
+    std::unique_ptr<TraceRenderer> tracer;
+    bool rasterDirty = true;
+    double cpuMs{};
     Buffer vertices;
     std::vector<Batch> batches;
     std::vector<uint32_t> visible;
@@ -86,7 +90,7 @@ struct Renderer::State
         });
         if (hasSurfCaps2) exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
 
-        vk::ApplicationInfo appInfo("PRTX Map Viewer", 1, nullptr, 0, VK_API_VERSION_1_0);
+        vk::ApplicationInfo appInfo("PRTX Map Viewer", 1, nullptr, 0, VK_API_VERSION_1_3);
         instance = vk::createInstanceUnique(
             vk::InstanceCreateInfo().setPApplicationInfo(&appInfo).setPEnabledExtensionNames(exts));
         surface = instance->createWin32SurfaceKHRUnique(
@@ -98,13 +102,13 @@ struct Renderer::State
             auto hasExt = [&](const char *name) {
                 return std::any_of(ext.begin(), ext.end(), [&](auto e) { return strcmp(e.extensionName, name) == 0; });
             };
-            if (!hasExt(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) continue;
+            if (gpu.getProperties().apiVersion < VK_API_VERSION_1_3 || !hasExt(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) continue;
 
             auto families = gpu.getQueueFamilyProperties();
             for (uint32_t i = 0; i < families.size(); ++i)
             {
                 if ((families[i].queueFlags & vk::QueueFlagBits::eGraphics) &&
-                    gpu.getSurfaceSupportKHR(i, *surface))
+                    (families[i].queueFlags & vk::QueueFlagBits::eCompute) && gpu.getSurfaceSupportKHR(i, *surface))
                 {
                     physical  = gpu;
                     family    = i;
@@ -122,7 +126,7 @@ struct Renderer::State
             if (physical) break;
         }
         if (!physical)
-            throw std::runtime_error("No Vulkan graphics device can present to this window.");
+            throw std::runtime_error("A Vulkan 1.3 graphics and compute queue with presentation support is required.");
 
         float priority = 1;
         vk::DeviceQueueCreateInfo qi({}, family, 1, &priority);
@@ -130,6 +134,7 @@ struct Renderer::State
         if (hasFseExt) devExts.push_back(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
         device = physical.createDeviceUnique(vk::DeviceCreateInfo({}, qi, {}, devExts));
 
+        Resources::device = *device;
         if (hasFseExt)
         {
             pfnAcquireFse = reinterpret_cast<PFN_vkAcquireFullScreenExclusiveModeEXT>(
@@ -144,10 +149,12 @@ struct Renderer::State
                 {{}, vk::QueryType::eTimestamp, uint32_t(frames.size() * 2)});
         queue = device->getQueue(family, 0);
         pool  = device->createCommandPoolUnique({vk::CommandPoolCreateFlagBits::eResetCommandBuffer, family});
+        transferCommand=command();
+        transferFence=device->createFenceUnique({});
         for (auto &f : frames)
         {
             f.cmd      = command();
-            f.acquired = device->createFenceUnique({});
+            f.acquired = device->createSemaphoreUnique({});
             f.fence    = device->createFenceUnique({vk::FenceCreateFlagBits::eSignaled});
         }
 
@@ -157,6 +164,8 @@ struct Renderer::State
         vk::PushConstantRange pc(vk::ShaderStageFlagBits::eVertex, 0, 64);
         layout = device->createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo({}, *descriptors, pc));
         loadAtlas();
+        tracer = std::make_unique<TraceRenderer>(*this, *atlas.view, *sampler,
+            [this](auto record) { transfer(record); });
     }
 
     ~State()
@@ -164,66 +173,23 @@ struct Renderer::State
         if (device) { vkDeviceWaitIdle(*device); releaseFse(); }
     }
 
-    // --- Resource & transfer helpers ---
-
     vk::UniqueCommandBuffer command()
     {
         return std::move(device->allocateCommandBuffersUnique(
             {*pool, vk::CommandBufferLevel::ePrimary, 1})[0]);
     }
 
-    vk::UniqueDeviceMemory allocate(vk::MemoryRequirements r, vk::MemoryPropertyFlags flags)
-    {
-        auto props = physical.getMemoryProperties();
-        for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
-            if ((r.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & flags) == flags)
-                return device->allocateMemoryUnique({r.size, i});
-        throw std::runtime_error("No suitable Vulkan memory type.");
-    }
-
-    Buffer buffer(size_t bytes, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags flags)
-    {
-        Buffer b;
-        b.handle = device->createBufferUnique({{}, bytes, usage});
-        b.memory = allocate(device->getBufferMemoryRequirements(*b.handle), flags);
-        device->bindBufferMemory(*b.handle, *b.memory, 0);
-        return b;
-    }
-
-    Buffer stage(const void *data, size_t bytes)
-    {
-        auto b = buffer(bytes, vk::BufferUsageFlagBits::eTransferSrc,
-                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-        void *dest = device->mapMemory(*b.memory, 0, bytes);
-        memcpy(dest, data, bytes);
-        device->unmapMemory(*b.memory);
-        return b;
-    }
-
     template <class F> void transfer(F record)
     {
-        auto c = command();
-        c->begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-        record(*c);
-        c->end();
+        auto c=*transferCommand;c.reset();
+        c.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+        record(c);c.end();
         vk::SubmitInfo info;
-        info.setCommandBuffers(*c);
-        queue.submit(info);
-        queue.waitIdle();
-    }
-
-    Texture texture(vk::Extent2D size, vk::Format fmt, vk::ImageUsageFlags usage, vk::ImageAspectFlags aspect)
-    {
-        Texture t;
-        t.image  = device->createImageUnique({{}, vk::ImageType::e2D, fmt, {size.width, size.height, 1},
-                                              1, 1, vk::SampleCountFlagBits::e1,
-                                              vk::ImageTiling::eOptimal, usage});
-        t.memory = allocate(device->getImageMemoryRequirements(*t.image),
-                            vk::MemoryPropertyFlagBits::eDeviceLocal);
-        device->bindImageMemory(*t.image, *t.memory, 0);
-        t.view   = device->createImageViewUnique({{}, *t.image, vk::ImageViewType::e2D,
-                                                  fmt, {}, {aspect, 0, 1, 0, 1}});
-        return t;
+        info.setCommandBuffers(c);
+        queue.submit(info,*transferFence);
+        if(device->waitForFences(*transferFence,true,UINT64_MAX)!=vk::Result::eSuccess)
+            throw std::runtime_error("Scene upload failed.");
+        device->resetFences(*transferFence);
     }
 
     void loadAtlas()
@@ -250,7 +216,7 @@ struct Renderer::State
             b.srcAccessMask = b.dstAccessMask;
             b.dstAccessMask = vk::AccessFlagBits::eShaderRead;
             c.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                              vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, b);
+                              vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eComputeShader, {}, {}, {}, b);
         });
         sampler = device->createSamplerUnique({});
         vk::DescriptorPoolSize capacity(vk::DescriptorType::eCombinedImageSampler, 1);
@@ -260,8 +226,6 @@ struct Renderer::State
         device->updateDescriptorSets(
             vk::WriteDescriptorSet(set, 0, 0, vk::DescriptorType::eCombinedImageSampler, imgInfo), {});
     }
-
-    // --- FSE & swapchain lifecycle ---
 
     void releaseFse()
     {
@@ -281,7 +245,8 @@ struct Renderer::State
 
     void createPipelines(vk::Format colorFmt, vk::Format depthFmt);
     void rebuild(vk::Extent2D size);
-    void draw(Camera const &, bool);
+    bool draw(Camera const &, bool, const TraceSettings &);
+    void rebuildRaster();
 };
 
 Renderer::Renderer(HWND h) : s(std::make_unique<State>(h)) {}
@@ -297,19 +262,24 @@ void Renderer::setFullScreen(bool fullscreen, bool acquire)
     else                s->releaseFse();
 }
 
-bool Renderer::isFullScreenExclusive() const { return s->fseAcquired; }
-
 void Renderer::upload(Map &map)
 {
+    s->tracer->load(map.world);
+    s->rasterDirty = true;
+}
+void Renderer::State::rebuildRaster() {
+    Map map;
+    const auto &world=tracer->world();
+    for(int key=0;key<4096;++key) if(world.chunks[key]) mesh(world,key,map);
     Buffer fresh;
     if (!map.quads.empty())
     {
         auto bytes   = map.quads.size() * sizeof(Quad);
-        auto staging = s->stage(map.quads.data(), bytes);
-        fresh = s->buffer(bytes,
+        auto staging = stage(map.quads.data(), bytes);
+        fresh = buffer(bytes,
                     vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
                     vk::MemoryPropertyFlagBits::eDeviceLocal);
-        s->transfer([&](vk::CommandBuffer c) {
+        transfer([&](vk::CommandBuffer c) {
             c.copyBuffer(*staging.handle, *fresh.handle, vk::BufferCopy(0, 0, bytes));
             vk::MemoryBarrier barrier(vk::AccessFlagBits::eTransferWrite,
                                      vk::AccessFlagBits::eVertexAttributeRead);
@@ -318,12 +288,14 @@ void Renderer::upload(Map &map)
         });
     }
     else
-        s->device->waitIdle();
-    std::swap(s->vertices, fresh);
-    s->batches = std::move(map.batches);
+        device->waitIdle();
+    std::swap(vertices, fresh);
+    batches = std::move(map.batches);
+    rasterDirty = false;
 }
 
-void Renderer::draw(Camera const &camera, bool measure) { s->draw(camera, measure); }
+bool Renderer::draw(Camera const &camera, bool measure) { return s->draw(camera, measure, settings); }
+double Renderer::cpuMilliseconds() const { return s->cpuMs; }
 double Renderer::gpuMilliseconds() const { return s->gpuMs; }
 const std::string &Renderer::adapterName() const { return s->gpuName; }
 
@@ -392,6 +364,7 @@ void Renderer::State::createPipelines(vk::Format colorFmt, vk::Format depthFmt)
                                             &raster, &ms, &depth, &blend, &dynamic, *layout, *pass);
         return device->createGraphicsPipelineUnique({}, info).value;
     };
+    tracer->presentation(*pass);
     opaquePipeline = makePipeline(VK_FALSE);
     cutoutPipeline = makePipeline(VK_TRUE);
 }
@@ -476,11 +449,11 @@ void Renderer::State::rebuild(vk::Extent2D size)
     acquireFse();
 }
 
-void Renderer::State::draw(Camera const &cam, bool measure)
+bool Renderer::State::draw(Camera const &cam, bool measure, const TraceSettings &settings)
 {
     RECT rect;
     GetClientRect(hwnd, &rect);
-    if (!rect.right || !rect.bottom) return;
+    if (!rect.right || !rect.bottom) return false;
     vk::Extent2D size(uint32_t(rect.right), uint32_t(rect.bottom));
     HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
     if (!swap || swap->extent != size || (wantFullScreen && swap->monitor != monitor))
@@ -488,9 +461,9 @@ void Renderer::State::draw(Camera const &cam, bool measure)
     if (wantFullScreen && wantAcquire && !fseAcquired)
         acquireFse();
 
+    if (!settings[Enabled] && rasterDirty) rebuildRaster();
     auto &frame = frames[frameIndex];
-    if (device->waitForFences(*frame.fence, true, UINT64_MAX) != vk::Result::eSuccess)
-        throw std::runtime_error("Vulkan frame wait failed.");
+    if (device->getFenceStatus(*frame.fence)==vk::Result::eNotReady) return false;
 
     const uint32_t query = uint32_t(frameIndex * 2);
     if (frame.timed)
@@ -502,19 +475,18 @@ void Renderer::State::draw(Camera const &cam, bool measure)
     }
 
     uint32_t image;
-    auto acquired = device->acquireNextImageKHR(*swap->chain, UINT64_MAX, {}, *frame.acquired, &image);
+    auto acquired = device->acquireNextImageKHR(*swap->chain, 0, *frame.acquired, {}, &image);
+    if(acquired==vk::Result::eNotReady || acquired==vk::Result::eTimeout) return false;
     if (acquired == vk::Result::eErrorOutOfDateKHR ||
         acquired == vk::Result::eErrorFullScreenExclusiveModeLostEXT)
     {
         if (acquired == vk::Result::eErrorFullScreenExclusiveModeLostEXT) fseAcquired = false;
         dropSwapchain();
-        return;
+        return false;
     }
     if (acquired != vk::Result::eSuccess && acquired != vk::Result::eSuboptimalKHR)
         throw std::runtime_error("Could not acquire a swapchain image.");
-    if (device->waitForFences(*frame.acquired, true, UINT64_MAX) != vk::Result::eSuccess)
-        throw std::runtime_error("Swapchain image wait failed.");
-    device->resetFences(*frame.acquired);
+    auto cpuStart = std::chrono::steady_clock::now();
 
     auto &target = swap->targets[image];
     auto  c      = *frame.cmd;
@@ -527,12 +499,15 @@ void Renderer::State::draw(Camera const &cam, bool measure)
         c.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *timestamps, query);
     }
 
+    if (settings[Enabled]) tracer->record(c,size,cam,settings,unsigned(frameIndex));
+    else tracer->invalidate();
     vk::ClearValue clears[] = {vk::ClearColorValue(std::array<float, 4>{.20f, .26f, .32f, 1}),
                                vk::ClearDepthStencilValue(1, 0)};
     c.beginRenderPass(vk::RenderPassBeginInfo(*pass, *target.framebuffer, {{0,0},size}, clears),
                       vk::SubpassContents::eInline);
 
-    if (vertices.handle)
+    if (settings[Enabled]) tracer->display(c,size,unsigned(frameIndex),settings[Denoise]!=0);
+    else if (vertices.handle)
     {
         float cp = std::cos(cam.pitch);
         auto view = XMMatrixLookToRH(
@@ -598,9 +573,12 @@ void Renderer::State::draw(Camera const &cam, bool measure)
 
     device->resetFences(*frame.fence);
     vk::SubmitInfo submit;
-    submit.setCommandBuffers(c).setSignalSemaphores(*target.presented);
+    vk::PipelineStageFlags acquireStage=vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    submit.setWaitSemaphores(*frame.acquired).setWaitDstStageMask(acquireStage)
+          .setCommandBuffers(c).setSignalSemaphores(*target.presented);
     queue.submit(submit, *frame.fence);
 
+    cpuMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-cpuStart).count();
     vk::PresentInfoKHR present(*target.presented, *swap->chain, image);
     auto result = queue.presentKHR(&present);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR ||
@@ -614,4 +592,5 @@ void Renderer::State::draw(Camera const &cam, bool measure)
         throw std::runtime_error("Vulkan presentation failed.");
 
     frameIndex = (frameIndex + 1) % frames.size();
+    return true;
 }

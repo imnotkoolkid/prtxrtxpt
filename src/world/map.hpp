@@ -1,7 +1,10 @@
 #pragma once
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
+struct World;
 struct Vec
 {
     float x{}, y{}, z{};
@@ -25,8 +28,10 @@ struct Batch
 };
 struct Map
 {
+    std::string name;
     Camera camera;
+    std::shared_ptr<World> world;
     std::vector<Quad> quads;
     std::vector<Batch> batches;
 };
-Map loadMap(std::wstring_view json);
+Map loadMap(std::wstring_view json, bool buildMesh = true);

@@ -1,0 +1,66 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "guide.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D source;
+layout(binding = 1) uniform sampler2D geometry;
+layout(binding = 2) uniform sampler2D guide;
+layout(binding = 3) uniform sampler2D history;
+layout(rgba16f, binding = 4) uniform writeonly image2D dest;
+layout(binding = 5) uniform sampler2D specSource;
+layout(rgba16f, binding = 6) uniform writeonly image2D specDest;
+layout(binding = 7) uniform sampler2D specHistory;
+layout(push_constant) uniform Filter {
+    vec4 camera;
+    int stride;
+}
+f;
+const float kernel[3] = float[](6., 4., 1.);
+float lum(vec3 c) { return dot(c, vec3(.2126, .7152, .0722)); }
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), size = imageSize(dest);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    vec4 h = texelFetch(history, p, 0), s = texelFetch(specHistory, p, 0);
+    vec4 a = texelFetch(guide, p, 0), g = texelFetch(geometry, p, 0);
+    vec3 center = texelFetch(source, p, 0).rgb, gloss = texelFetch(specSource, p, 0).rgb;
+    if (g.w <= 0.) {
+        imageStore(dest, p, vec4(min(center, vec3(65504.)), 1));
+        imageStore(specDest, p, vec4(min(gloss, vec3(65504.)), 1));
+        return;
+    }
+    vec2 mean = vec2(lum(h.rgb), lum(s.rgb));
+    vec2 variance = max(vec2(0), exp2(vec2(a.w, s.w)) - 1. - mean * mean);
+    vec2 sigma = .025 + .65 * mean / sqrt(max(h.w, 1.)) + 2. * sqrt(variance / max(h.w, 1.));
+    float rough = float((uint(g.w) >> 3u) & 15u) / 15.;
+    float footprint = max(.01, distance(f.camera.xyz, g.xyz) * 3. * f.stride / size.y);
+    vec3 normal = guideNormal(g.w);
+    footprint = surfaceFootprint(footprint, g.xyz - f.camera.xyz, normal);
+    vec2 total = vec2(0);
+    vec3 sum = vec3(0), sumSpec = vec3(0);
+    for (int y = -2; y <= 2; ++y)
+        for (int x = -2; x <= 2; ++x) {
+            ivec2 q = clamp(p + ivec2(x, y) * f.stride, ivec2(0), size - 1);
+            vec4 other = texelFetch(geometry, q, 0);
+            if (g.w != other.w)
+                continue;
+            vec3 rgb = texelFetch(source, q, 0).rgb, spec = texelFetch(specSource, q, 0).rgb;
+            vec3 albedo = texelFetch(guide, q, 0).rgb, delta = other.xyz - g.xyz;
+            if (abs(dot(normal, delta)) > .01)
+                continue;
+            float spatial =
+                kernel[abs(x)] * kernel[abs(y)] *
+                exp(-dot(delta, delta) / (8. * footprint * footprint) - 12. * distance(a.rgb, albedo));
+            vec2 weight = spatial * exp(-abs(vec2(lum(rgb) - lum(center), lum(spec) - lum(gloss))) / sigma);
+            // Narrow the glossy filter towards delta reflection and refraction.
+            weight.y *= exp(-float(x * x + y * y) * float(f.stride) * 3. * pow(1. - rough, 4.));
+            sum += weight.x * rgb;
+            sumSpec += weight.y * spec;
+            total += weight;
+        }
+    float strength = min(1., 6. * inversesqrt(max(1., h.w)));
+    vec3 filtered = mix(center, sum / max(total.x, .000001), strength);
+    vec3 filteredSpec = mix(gloss, sumSpec / max(total.y, .000001), strength);
+    imageStore(dest, p, vec4(min(filtered, vec3(65504.)), 1));
+    imageStore(specDest, p, vec4(min(filteredSpec, vec3(65504.)), 1));
+}

@@ -109,7 +109,7 @@ void plants(std::vector<Quad> &dst, Block b, Vec p)
         if (b.flags & (face ? Bottom : Top))
             emitQuad(dst, p, {p.x + 1, p.y + 1, p.z + 1}, b, face, true);
 }
-} // namespace
+} 
 
 void mesh(World const &world, int key, Map &out)
 {
@@ -162,7 +162,6 @@ void mesh(World const &world, int key, Map &out)
                 }
             }
 
-            // Greedy quad merging.
             for (int j = 0; j < 16; ++j)
             {
                 for (int i = 0; i < 16; ++i)
@@ -177,7 +176,7 @@ void mesh(World const &world, int key, Map &out)
                         while (j + h < 16 &&
                                std::all_of(mask[j+h]+i, mask[j+h]+i+w, [=](auto t){ return t == idx; }))
                             ++h;
-                    for (int k = 0; k < h; ++k) std::fill_n(mask[j+k]+i, w, uint16_t(0));
+                    for (int k = 1; k < h; ++k) std::fill_n(mask[j+k]+i, w, uint16_t(0));
 
                     float lo[3], hi[3];
                     lo[axis] = float(base[axis] + s);
@@ -202,6 +201,7 @@ void mesh(World const &world, int key, Map &out)
                     bool isCutout = (b.flags & Transparent) || b.shape == Wall;
                     emitQuad(isCutout ? cutouts : out.quads,
                              {lo[0],lo[1],lo[2]}, {hi[0],hi[1],hi[2]}, b, face);
+                    i += w - 1;
                 }
             }
         }
